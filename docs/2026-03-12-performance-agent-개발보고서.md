@@ -1,9 +1,10 @@
 # 공연/전시회 AI Agent 개발 보고서
 
 > **작성일**: 2026-03-12
+> **최종 수정**: 2026-03-12 (통합 테스트 + 프롬프트 개선 추가)
 > **프로젝트**: ai_agent (Agent Education Template Server)
 > **도메인**: 공연/전시회 정보 검색, 추천, 상세 조회
-> **데이터 소스**: KOPIS (공연예술통합전산센터) 공공 API
+> **데이터 소스**: KOPIS (공연예술통합전산센터) 공공 API + Elasticsearch
 
 ---
 
@@ -12,10 +13,15 @@
 사내 AI Agent 교육 과정에서 LangChain + LangGraph 기반의 ReAct Agent를 구현했습니다.
 기존 템플릿 프로젝트(`agent-edu-template-server`)를 기반으로 **공연/전시회 도우미** 에이전트를 개발하고, 프론트엔드 UI(`ai_agent_ui`)와 연동하여 실제 서비스 형태로 동작하는 것까지 완료했습니다.
 
-### 오늘의 목표
+이후 **Elasticsearch 연동**을 통해 KOPIS 데이터를 ES에 인덱싱하고, BM25 + kNN 하이브리드 검색(수동 RRF)으로 전환했으며, 에이전트 구조를 `create_react_agent` → `StateGraph`로 전환했습니다.
+
+### Day 1 목표
 - Agent 개발 (도구 구현 + LangGraph 에이전트 생성 + 서비스 연동)
 - UI 연동 및 테스트 완료
-- 내일: ElasticSearch 연동 (Retriever로 전환)
+
+### Day 2 목표
+- Elasticsearch 연동 (KOPIS 데이터 인덱싱 + 하이브리드 검색)
+- StateGraph 전환 (create_react_agent → 명시적 노드/엣지 그래프)
 
 ---
 
@@ -25,7 +31,9 @@
 |------|------|------|
 | Backend Framework | FastAPI + Uvicorn | 0.104+ |
 | AI Framework | LangChain + LangGraph | 1.0+ / 0.2+ |
-| LLM | OpenAI GPT (ChatOpenAI) | - |
+| LLM | OpenAI GPT (ChatOpenAI) | gpt-4.1 |
+| 임베딩 | OpenAI text-embedding-3-small | 1536차원 |
+| 검색 엔진 | Elasticsearch | 9.3.0 (Basic License) |
 | 데이터 소스 | KOPIS 공공 API | REST XML |
 | XML 파싱 | xmltodict | - |
 | Frontend | React + Vite + TypeScript | - |
@@ -35,6 +43,19 @@
 ---
 
 ## 3. 아키텍처
+
+### Day 1 아키텍처 (KOPIS API 직접 호출)
+
+```
+[Frontend] ──POST /api/v1/chat/──▶ [AgentService] ──▶ [LangGraph ReAct Agent]
+                                                          │
+                                              ┌───────────┼───────────┐
+                                              ▼           ▼           ▼
+                                        [KOPIS API] [KOPIS API] [KOPIS API]
+                                         (검색)      (상세)      (추천)
+```
+
+### Day 2 아키텍처 (Elasticsearch 하이브리드 검색)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -54,22 +75,33 @@
 │  │  └─ ChatResponse 도구 인터셉트 → step: "done"    │   │
 │  └──────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────┐   │
-│  │ LangGraph ReAct Agent (create_react_agent)        │   │
-│  │  ├─ LLM: ChatOpenAI (temperature=0)              │   │
-│  │  ├─ Checkpointer: MemorySaver (멀티턴 메모리)     │   │
-│  │  └─ Tools:                                        │   │
-│  │     ├─ search_performances (검색)                 │   │
-│  │     ├─ get_performance_detail (상세 조회)          │   │
-│  │     ├─ recommend_performances (추천)               │   │
-│  │     └─ ChatResponse (최종 응답 전달)               │   │
+│  │ LangGraph StateGraph 에이전트                      │   │
+│  │  ├─ agent 노드: LLM + bind_tools (도구 호출 결정) │   │
+│  │  ├─ tools 노드: ToolNode (도구 실행)              │   │
+│  │  ├─ 조건부 엣지: tool_calls 유무로 라우팅          │   │
+│  │  └─ Checkpointer: MemorySaver (멀티턴 메모리)     │   │
+│  └───────────────────────┬──────────────────────────┘   │
+│                          │                               │
+│  ┌───────────────────────┼──────────────────────────┐   │
+│  │ Tools (ES 하이브리드 검색)                         │   │
+│  │  ├─ search_performances ──▶ BM25 + kNN + RRF     │   │
+│  │  ├─ recommend_performances ──▶ BM25 + kNN + RRF  │   │
+│  │  ├─ get_performance_detail ──▶ ES + KOPIS API    │   │
+│  │  └─ ChatResponse (최종 응답 전달)                  │   │
 │  └───────────────────────┬──────────────────────────┘   │
 └──────────────────────────┬──────────────────────────────┘
-                           │ HTTP GET (XML)
-┌──────────────────────────▼──────────────────────────────┐
-│  KOPIS 공공 API (http://www.kopis.or.kr/openApi/)       │
-│  ├─ /pblprfr (공연 목록 검색)                            │
-│  └─ /pblprfr/{id} (공연 상세 조회)                       │
-└─────────────────────────────────────────────────────────┘
+            ┌──────────────┼──────────────┐
+            ▼                             ▼
+┌──────────────────────┐     ┌──────────────────────────┐
+│  Elasticsearch 9.3   │     │  KOPIS API (상세 조회만)   │
+│  (performances 인덱스) │     │  /pblprfr/{id}           │
+│  ├─ BM25 텍스트 검색  │     └──────────────────────────┘
+│  ├─ kNN 벡터 검색     │
+│  └─ 수동 RRF 결합     │
+└──────────────────────┘
+
+[인덱싱 파이프라인]
+  KOPIS API ──(323건 수집)──▶ OpenAI Embedding ──▶ ES Bulk 인덱싱
 ```
 
 ---
@@ -119,11 +151,14 @@ def create_performance_agent(checkpointer=None):
 
 ### 4.2 수정 파일
 
-#### (1) `app/agents/prompts.py` - 시스템 프롬프트
+#### (1) `app/agents/prompts.py` - 시스템 프롬프트 (동적 생성)
 
+- `get_system_prompt()` 함수로 **현재 날짜를 동적 주입** (정적 문자열 → 동적 함수)
 - 페르소나: "공연 도우미" AI 어시스턴트
 - 역할 정의: 검색, 추천, 상세 정보 제공
 - 지원 장르/지역 명시
+- 지역 매핑 규칙: 세부 지역(강남, 수원, 해운대) → 시/도(서울, 경기, 부산) 매핑
+- 검색 의도 파악 규칙: 가족/어린이 키워드 → 장르 미제한 의미 검색
 - ChatResponse 도구를 통한 최종 응답 포맷 지정
 
 #### (2) `app/services/agent_service.py` - 서비스 레이어 (핵심 수정)
@@ -278,17 +313,20 @@ if not event or not (step in ["model", "agent", "tools"]):
 
 ```
 ai_agent/agent/
-├── .env                          # KOPIS_API_KEY 등 환경변수
-├── pyproject.toml                # 의존성 (langgraph 추가)
+├── .env                          # API 키, ES 접속 정보 등
+├── pyproject.toml                # 의존성 (elasticsearch, langchain-elasticsearch 추가)
 ├── app/
 │   ├── agents/
-│   │   ├── tools.py              # [신규] KOPIS API 도구 4개
-│   │   ├── prompts.py            # [수정] 공연 도우미 시스템 프롬프트
-│   │   └── performance_agent.py  # [신규] LangGraph ReAct 에이전트
+│   │   ├── tools.py              # ES 하이브리드 검색 도구 (BM25+kNN+RRF)
+│   │   ├── prompts.py            # 공연 도우미 시스템 프롬프트
+│   │   └── performance_agent.py  # StateGraph 에이전트
 │   ├── services/
-│   │   └── agent_service.py      # [수정] 스트리밍 + 메모리 연동
+│   │   └── agent_service.py      # SSE 스트리밍 + 메모리 연동
 │   ├── core/
-│   │   └── config.py             # [수정] KOPIS_API_KEY 설정 추가
+│   │   ├── config.py             # 설정 (OpenAI, KOPIS, ES)
+│   │   └── elasticsearch.py      # [신규] ES 클라이언트 싱글톤
+│   ├── scripts/
+│   │   └── index_performances.py # [신규] KOPIS→ES 인덱싱 스크립트
 │   └── ...
 └── docs/
     └── 2026-03-12-performance-agent-개발보고서.md  # 본 문서
@@ -296,20 +334,292 @@ ai_agent/agent/
 
 ---
 
-## 9. 향후 계획
+## 9. Elasticsearch 연동 (Day 2)
+
+### 9.1 개요
+
+Day 1에서 구현한 KOPIS API 직접 호출 방식을 Elasticsearch 하이브리드 검색으로 전환했습니다.
+
+| 항목 | Before (Day 1) | After (Day 2) |
+|------|----------------|---------------|
+| 검색 방식 | KOPIS API 직접 호출 | ES BM25 + kNN 하이브리드 |
+| 에이전트 구조 | `create_react_agent` | `StateGraph` (명시적 노드/엣지) |
+| 데이터 소스 | 실시간 KOPIS API | ES 인덱스 (323건) + KOPIS API (상세만) |
+| 임베딩 | 없음 | OpenAI text-embedding-3-small (1536차원) |
+| 검색 정확도 | 키워드 매칭만 | 키워드 + 의미적 유사성 결합 |
+
+### 9.2 ES 클러스터 정보
+
+| 항목 | 값 |
+|------|-----|
+| ES 버전 | 9.3.0 |
+| Kibana URL | https://kibana-edu.didim365.app |
+| ES URL | https://elasticsearch-edu.didim365.app |
+| 라이선스 | Basic (무료) |
+| 인덱스 이름 | `performances` |
+| 문서 수 | 323건 |
+
+### 9.3 인덱스 매핑 설계
+
+`performances` 인덱스는 **구조화된 필터링 필드**, **BM25 텍스트 필드**, **dense_vector 벡터 필드**로 구성됩니다.
+
+| 필드 | 타입 | 용도 |
+|------|------|------|
+| `performance_id` | keyword | 공연 고유 ID (PF000000) |
+| `name` | text | 공연명 (BM25 검색) |
+| `genre` | keyword | 장르 필터링 |
+| `region` | keyword | 지역 필터링 (17개 시도) |
+| `venue` | text | 공연장 (BM25 검색) |
+| `cast` | text | 출연진 (BM25 검색) |
+| `start_date` / `end_date` | date | 기간 필터링 (yyyyMMdd) |
+| `state` | keyword | 공연상태 (공연중/공연예정) |
+| `combined_text` | text | 결합 텍스트 (BM25 검색) |
+| `embedding` | dense_vector (1536) | OpenAI 임베딩 (kNN 검색) |
+| `price`, `runtime`, `age`, `schedule`, `poster_url` | text/keyword | 부가 정보 |
+
+### 9.4 데이터 인덱싱 파이프라인
+
+**실행**: `.venv/bin/python -m app.scripts.index_performances`
+
+```
+[1] KOPIS API 수집 (장르별 50건 × 7장르 = 323건 고유)
+        ↓
+[2] 상세 정보 조회 (323건 × detail API)
+    └─ area 필드에서 지역 추출 (경기도 → 경기)
+        ↓
+[3] combined_text 생성
+    └─ "공연명: {name} | 장르: {genre} | 장소: {venue} | 지역: {region} | ..."
+        ↓
+[4] OpenAI 임베딩 생성 (text-embedding-3-small, 배치 100건)
+        ↓
+[5] ES Bulk 인덱싱 (323건 성공)
+```
+
+**장르별 분포**: 연극 50, 뮤지컬 50, 무용 50, 클래식 50, 오페라 50, 국악 50, 복합 23
+**지역별 분포**: 서울 158, 경기 40, 부산 22, 대구 14, 광주 12 등 17개 시도 전체
+
+### 9.5 하이브리드 검색 구현 (BM25 + kNN + 수동 RRF)
+
+ES Basic 라이선스에서는 내장 RRF를 사용할 수 없어, Python에서 수동으로 RRF를 구현했습니다.
+
+**검색 흐름:**
+```
+사용자 쿼리: "서울에서 하는 뮤지컬"
+        ↓
+[1] 필터 구성: genre="뮤지컬", region="서울"
+        ↓
+[2] OpenAI로 쿼리 임베딩 생성
+        ↓
+[3] ES에 2개 검색 요청을 병렬 실행:
+    ├─ BM25: multi_match (name^3, combined_text^2, venue, cast) + 필터
+    └─ kNN: dense_vector 유사도 검색 (cosine) + 필터
+        ↓
+[4] 수동 RRF 결합: score(d) = Σ 1/(k + rank_i)  (k=60)
+        ↓
+[5] 상위 10건 반환
+```
+
+**RRF (Reciprocal Rank Fusion) 원리:**
+- 점수 스케일이 다른 두 검색 결과를 **순위 기반**으로 공정하게 결합
+- 양쪽 검색에서 모두 상위에 있는 문서가 최종 상위로 올라옴
+- `k=60`은 표준 기본값으로, 순위 차이에 의한 점수 편차를 완화
+
+### 9.6 StateGraph 에이전트 전환
+
+`create_react_agent` (블랙박스) → `StateGraph` (명시적 노드/엣지)로 전환했습니다.
+
+```python
+# StateGraph 구조
+graph = StateGraph(AgentState)
+
+graph.add_node("agent", agent_node)    # LLM이 도구 호출 결정
+graph.add_node("tools", tool_node)     # ToolNode가 도구 실행
+
+graph.set_entry_point("agent")
+graph.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
+graph.add_edge("tools", "agent")       # tools → agent 루프
+```
+
+**전환 이유:**
+- 그래프 흐름을 명시적으로 제어 가능
+- 추후 검증/가드레일 노드 추가 용이
+- `agent_service.py`와의 스트리밍 호환성 유지 (step 이름: "agent", "tools")
+
+### 9.7 변경 파일 목록
+
+| 파일 | 변경 유형 | 내용 |
+|------|----------|------|
+| `pyproject.toml` | 수정 | `elasticsearch`, `langchain-elasticsearch` 의존성 추가 |
+| `.env` | 수정 | ES_URL, ES_USERNAME, ES_PASSWORD 추가 |
+| `app/core/config.py` | 수정 | ES 설정 필드 3개 추가 |
+| `app/core/elasticsearch.py` | **신규** | ES 클라이언트 싱글톤 모듈 |
+| `app/scripts/__init__.py` | **신규** | 스크립트 패키지 초기화 |
+| `app/scripts/index_performances.py` | **신규** | KOPIS→ES 인덱싱 스크립트 (323건) |
+| `app/agents/tools.py` | **전면 개편** | KOPIS API 직접 호출 → ES 하이브리드 검색 |
+| `app/agents/performance_agent.py` | **전면 개편** | `create_react_agent` → `StateGraph` |
+| `app/agents/prompts.py` | 수정 | ES 검색 관련 설명 추가 |
+
+### 9.8 ES 라이선스 제약과 대응
+
+| 기능 | ES 내장 | 필요 라이선스 | 우리의 대응 |
+|------|---------|-------------|------------|
+| BM25 텍스트 검색 | ✅ | Basic (무료) | 그대로 사용 |
+| kNN 벡터 검색 | ✅ | Basic (무료) | 그대로 사용 |
+| dense_vector 필드 | ✅ | Basic (무료) | 그대로 사용 |
+| RRF (결과 결합) | ❌ | Platinum (유료) | Python 수동 구현 |
+| semantic_text (자동 임베딩) | ❌ | Platinum (유료) | OpenAI API로 외부 생성 |
+| ELSER / Inference API | ❌ | Platinum (유료) | 미사용 |
+
+---
+
+## 10. 통합 테스트 및 프롬프트 개선 (Day 2 후반)
+
+### 10.1 상세 통합 테스트 설계
+
+Day 2 기본 기능 테스트(5건) 완료 후, ES 데이터 분포를 분석하여 **8개 카테고리, 13개 세부 테스트 케이스**를 설계하고 실행했습니다.
+
+**ES 데이터 분포 분석:**
+- 총 문서: 323건, 장르 7종, 지역 16개 (세종 0건)
+- 오페라: 장르명만 있고 실제 데이터 0건
+- 빈 지역+장르 조합: 36개
+
+**테스트 카테고리:**
+
+| 우선순위 | 카테고리 | 검증 목표 |
+|---------|---------|----------|
+| 🔴 Critical | 빈 결과 / 엣지 케이스 | 빈 데이터 처리, 존재하지 않는 공연 검색 |
+| 🟡 Medium | 멀티턴 / LLM 파라미터 추출 | 문맥 유지, 비표준 장르/지역 매핑 |
+| 🟢 Normal | 의미 검색 품질 / 경계값 | 시맨틱 검색 정확도, 역할 범위 준수 |
+| 🔵 Bonus | 비정상 입력 / 다국어 | 크래시 방지, 영어 입력 처리 |
+
+### 10.2 통합 테스트 결과 (13건)
+
+| # | 카테고리 | 테스트 입력 | 검증 포인트 | 결과 |
+|---|---------|-----------|-----------|------|
+| 2-1 | 빈 결과 | "세종에서 하는 공연" | 0건 처리 | ✅ PASS |
+| 2-2 | 빈 결과 | "오페라 공연 추천" | 0건 장르 처리 | ✅ PASS |
+| 2-3 | 빈 결과 | "해리포터 뮤지컬" | 미존재 검색 | ✅ PASS (대안 추천) |
+| 1-1 | 날짜 변환 | "4월에 하는 뮤지컬" | 현재 연도 적용 | ❌ **FAIL** → 수정 후 ✅ |
+| 4-1 | 멀티턴 | "두번째 공연 상세" | 목록 참조 | ✅ PASS |
+| 4-2 | 조건 변경 | "경기 말고 부산 연극" | 장르 유지+지역 변경 | ✅ PASS |
+| 3-1 | 비표준 장르 | "발레 공연" | 무용 매핑 | ✅ PASS |
+| 3-2 | 하위 지역 | "강남 연극" | 서울 매핑 | ⚠️ **PARTIAL** → 수정 후 ✅ |
+| 5-1 | 의미 검색 | "가족 공연" | 장르 미제한 검색 | ⚠️ **PARTIAL** → 수정 후 ✅ |
+| 5-2 | 의미 검색 | "전통 문화 공연" | 국악 매핑 | ✅ PASS |
+| 6-1 | 역할 경계 | "김종욱 찾기 예매해줘" | 예매 거절+정보 제공 | ✅ PASS |
+| 8-1 | 비정상 입력 | "ㅁㄴㅇㄹ ㅋㅋㅋ" | 크래시 방지 | ✅ PASS |
+| 8-2 | 다국어 | "Musical in Seoul" | 영어 처리 | ✅ PASS |
+
+**초회 결과: 10 PASS / 1 FAIL / 2 PARTIAL → 3건 개선 필요 발견**
+
+### 10.3 발견된 이슈 및 프롬프트 개선
+
+3건의 이슈 모두 **코드 수정 없이 시스템 프롬프트 개선만으로 해결**했습니다.
+
+#### 이슈 1: [Critical] 날짜 변환 시 잘못된 연도 적용
+
+| 항목 | 내용 |
+|------|------|
+| **증상** | "4월에 하는 뮤지컬" → "2024년 4월"로 검색 (잘못된 연도) |
+| **원인** | 시스템 프롬프트에 현재 날짜 정보가 없음 → LLM이 학습 데이터 기준으로 추정 |
+| **해결** | `prompts.py`를 정적 문자열 → `get_system_prompt()` 동적 함수로 변경, `datetime.now()` 주입 |
+| **검증** | "4월에 하는 뮤지컬" → ✅ "**2026년** 4월" 정확한 연도로 검색 |
+
+#### 이슈 2: [Minor] 하위 지역명 매핑 미지원
+
+| 항목 | 내용 |
+|------|------|
+| **증상** | "강남에서 하는 연극" → 강남을 키워드로만 처리, 서울로 매핑하지 않음 |
+| **원인** | 시스템 프롬프트에 하위 지역 → 상위 시/도 매핑 규칙 없음 |
+| **해결** | "지역 매핑 규칙" 섹션 추가 (강남→서울, 수원→경기, 해운대→부산 등) |
+| **검증** | "강남에서 하는 연극" → ✅ "**강남은 서울 지역에 해당하므로**, 서울 지역에서 진행되는 연극을 안내해드립니다" |
+
+#### 이슈 3: [Minor] 가족/어린이 키워드의 잘못된 장르 매핑
+
+| 항목 | 내용 |
+|------|------|
+| **증상** | "가족 공연 추천" → "복합" 장르로 필터링 → 실제 아동극/가족 뮤지컬 누락 |
+| **원인** | LLM이 "가족"을 장르 "복합"으로 잘못 분류 |
+| **해결** | "검색 의도 파악 규칙" 추가: 가족/아이/어린이 키워드 → 장르 미제한 + keyword 의미 검색 |
+| **검증** | "아이와 함께 볼 수 있는 가족 공연 추천해줘" → ✅ 장르 제한 없이 가족 음악오케스트라, 아동극, 전시회 등 **다양한 장르** 결과 |
+
+### 10.4 수정 파일 상세
+
+#### (1) `app/agents/prompts.py` — 동적 시스템 프롬프트
+
+```python
+# Before: 정적 문자열
+system_prompt = """당신은 공연/전시회 정보 전문 AI 어시스턴트..."""
+
+# After: 동적 함수 (현재 날짜 + 매핑 규칙 주입)
+def get_system_prompt() -> str:
+    current_date = datetime.now().strftime("%Y년 %m월 %d일")
+    current_date_yyyymmdd = datetime.now().strftime("%Y%m%d")
+    return f"""...
+# 현재 날짜: {current_date} ({current_date_yyyymmdd})
+# 지역 매핑 규칙: 강남→서울, 수원→경기, 해운대→부산 ...
+# 검색 의도 파악 규칙: 가족/아이/어린이 → 장르 미제한 의미 검색
+..."""
+```
+
+**추가된 프롬프트 섹션:**
+
+| 섹션 | 내용 |
+|------|------|
+| 현재 날짜 | `datetime.now()` 포맷팅하여 주입, 날짜 계산 기준 명시 |
+| 지역 매핑 규칙 | 세부 지역 → 시/도 매핑 예시 + 안내 문구 가이드 |
+| 검색 의도 파악 규칙 | 가족/어린이 키워드 → keyword 의미 검색, 비표준 장르 매핑 |
+
+#### (2) `app/agents/performance_agent.py` — import 업데이트
+
+```python
+# Before
+from app.agents.prompts import system_prompt
+sys_msg = SystemMessage(content=system_prompt)
+
+# After
+from app.agents.prompts import get_system_prompt
+sys_msg = SystemMessage(content=get_system_prompt())
+```
+
+### 10.5 회귀 테스트 결과 (3/3 PASS)
+
+수정 후 서버를 재시작하고 3건의 회귀 테스트를 수행하여 모두 통과했습니다.
+
+| # | 수정 항목 | 테스트 입력 | 이전 결과 | 수정 후 결과 |
+|---|---------|-----------|---------|-----------|
+| 1 | 날짜 동적 주입 | "4월에 하는 뮤지컬 알려줘" | ❌ "2024년 4월" | ✅ "**2026년 4월**" |
+| 2 | 지역 매핑 규칙 | "강남에서 하는 연극 알려줘" | ⚠️ 키워드 처리 | ✅ "**강남은 서울 지역에 해당**" + 서울 연극 10건 |
+| 3 | 가족 의미 검색 | "아이와 함께 볼 수 있는 가족 공연" | ⚠️ "복합" 장르만 | ✅ 가족 음악오케스트라, 아동극, 전시회 등 **다양한 장르** |
+
+### 10.6 핵심 교훈: 프롬프트 엔지니어링의 효과
+
+> **코드 변경 0줄, 프롬프트만 수정하여 3가지 이슈 모두 해결**
+
+| 관점 | 내용 |
+|------|------|
+| 동적 컨텍스트 주입 | LLM은 현재 날짜를 모름 → 런타임에 `datetime.now()` 주입 필수 |
+| 구체적 매핑 예시 | "지역 매핑하라"보다 "강남→서울, 수원→경기" 예시가 LLM에 훨씬 효과적 |
+| 부정 지시 | "장르로 제한하지 말고 keyword에 포함하여 의미 검색" 처럼 **하지 말아야 할 행동**도 명시 |
+| 테스트의 중요성 | 기본 happy path만으로는 발견할 수 없는 이슈 → 데이터 분포 기반 엣지 케이스 설계 필수 |
+
+---
+
+## 11. 향후 계획
 
 | 일정 | 작업 | 내용 |
 |------|------|------|
-| Day 2 | ElasticSearch 연동 | tools.py의 직접 API 호출 → ES Retriever로 전환 |
-| Day 2 | 데이터 인덱싱 | KOPIS 공연 데이터를 ES에 주기적 색인 |
-| 추후 | 성능 개선 | 응답 속도 최적화, 캐싱 도입 |
+| 추후 | 데이터 갱신 자동화 | 인덱싱 스크립트 스케줄링 (cron 등) |
+| 추후 | 성능 개선 | 응답 속도 최적화, 임베딩 캐싱 |
 | 추후 | 기능 확장 | 예매 링크 연동, 유사 공연 추천, 리뷰 정보 |
 
 ---
 
-## 10. 참고사항
+## 12. 참고사항
 
-- **KOPIS API 제한**: 한 번에 최대 100건 조회 가능 (현재 20건으로 설정)
+- **KOPIS API 제한**: 한 번에 최대 100건 조회 가능 (인덱싱 시 50건/요청)
 - **MemorySaver**: 인메모리 방식으로 서버 재시작 시 대화 이력 초기화
-- **LangGraph v2 호환**: `"agent"` 노드 이름 사용 (v1의 `"model"`과 함께 지원)
-- **SSL 검증 비활성화**: KOPIS API 호출 시 `verify=False` (개발 환경 한정)
+- **LangGraph v2 호환**: StateGraph에서 노드 이름 "agent", "tools" 사용 (agent_service.py와 호환)
+- **SSL 검증 비활성화**: KOPIS API, ES 모두 `verify=False` (개발 환경 한정)
+- **ES Basic 라이선스**: RRF, Inference API 사용 불가 → Python 수동 구현으로 대체
+- **인덱싱 재실행**: `.venv/bin/python -m app.scripts.index_performances`로 언제든 데이터 갱신 가능
