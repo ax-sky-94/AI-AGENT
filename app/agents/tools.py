@@ -178,6 +178,64 @@ def _hybrid_search(query: str, filters: list[dict] = None,
     return combined
 
 
+# ─── KOPIS API 폴백 (Graceful Degradation) ───────────────────────────────────
+# IMP: ES 인덱스가 없거나 연결 실패 시, KOPIS 공공데이터 API로 폴백하여
+# 기본 조회 결과를 제공합니다. ES 하이브리드 검색 대비 정확도는 낮지만
+# 서비스 중단 없이 응답을 유지합니다.
+KOPIS_FALLBACK_NOTICE = "※ 공공데이터 기본 조회 결과입니다. 일부 조건이 반영되지 않을 수 있습니다.\n"
+
+
+def _kopis_fallback_search(
+    keyword: str = "", genre: str = "", region: str = "",
+    start_date: str = "", end_date: str = "", rows: int = 10,
+) -> list[dict]:
+    """KOPIS API 직접 조회 (ES 폴백용).
+    장르/지역/기간 필터 + 공연명 키워드(shprfnm) 검색을 지원합니다.
+    """
+    if not start_date:
+        start_date = datetime.now().strftime("%Y%m%d")
+    if not end_date:
+        end_date = (datetime.now() + timedelta(days=90)).strftime("%Y%m%d")
+
+    params = {
+        "service": settings.KOPIS_API_KEY,
+        "stdate": start_date,
+        "eddate": end_date,
+        "rows": str(rows),
+        "cpage": "1",
+    }
+    if keyword:
+        params["shprfnm"] = keyword
+    if genre and genre in GENRE_CODE_MAP:
+        params["shcate"] = GENRE_CODE_MAP[genre]
+    if region and region in REGION_CODE_MAP:
+        params["signgucode"] = REGION_CODE_MAP[region]
+
+    url = f"{KOPIS_BASE_URL}pblprfr"
+    response = requests.get(url, params=params, verify=False)
+    response.raise_for_status()
+
+    data = xmltodict.parse(response.text)
+    db_data = data.get("dbs", {}).get("db")
+    if not db_data:
+        return []
+    if isinstance(db_data, dict):
+        return [db_data]
+    return db_data
+
+
+def _format_kopis_item(item: dict) -> str:
+    """KOPIS API 응답 항목을 읽기 좋은 문자열로 변환"""
+    perf_id = item.get("mt20id", "")
+    name = item.get("prfnm", "알 수 없음")
+    genre = item.get("genrenm", "")
+    venue = item.get("fcltynm", "알 수 없음")
+    start = item.get("prfpdfrom", "")
+    end = item.get("prfpdto", "")
+    state = item.get("prfstate", "")
+    return f"[{perf_id}] {name} | {genre} | {venue} | {start}~{end} | {state}"
+
+
 # ─── 포맷팅 헬퍼 ──────────────────────────────────────────────────────────────
 def _format_performance(doc: dict) -> str:
     """ES 문서를 읽기 좋은 문자열로 변환"""
@@ -214,16 +272,14 @@ def search_performances(
     Returns:
         검색된 공연 목록 정보
     """
+    if not start_date:
+        start_date = datetime.now().strftime("%Y%m%d")
+    if not end_date:
+        end_date = (datetime.now() + timedelta(days=90)).strftime("%Y%m%d")
+
+    # 1) ES 하이브리드 검색 시도
     try:
-        if not start_date:
-            start_date = datetime.now().strftime("%Y%m%d")
-        if not end_date:
-            end_date = (datetime.now() + timedelta(days=90)).strftime("%Y%m%d")
-
-        # 필터 조건 구성
         filters = _build_filters(genre, region, start_date, end_date)
-
-        # 검색 쿼리 구성 (키워드가 없으면 필터 + 장르/지역 정보로 검색)
         search_query = keyword if keyword else f"{region} {genre} 공연".strip()
 
         # IMP: 하이브리드 검색 실행 (BM25 텍스트 검색 + kNN 벡터 검색 + RRF 결합)
@@ -235,6 +291,25 @@ def search_performances(
         output_lines = [f"총 {len(results)}건의 공연이 검색되었습니다.\n"]
         for doc in results:
             output_lines.append(f"- {_format_performance(doc)}")
+
+        return "\n".join(output_lines)
+    except Exception:
+        pass
+
+    # 2) Graceful Degradation: KOPIS API 폴백
+    try:
+        fallback_results = _kopis_fallback_search(
+            keyword=keyword, genre=genre, region=region,
+            start_date=start_date, end_date=end_date, rows=10,
+        )
+
+        if not fallback_results:
+            return "검색 결과가 없습니다. 다른 조건으로 다시 검색해보세요."
+
+        output_lines = [KOPIS_FALLBACK_NOTICE]
+        output_lines.append(f"총 {len(fallback_results)}건의 공연이 검색되었습니다.\n")
+        for item in fallback_results:
+            output_lines.append(f"- {_format_kopis_item(item)}")
 
         return "\n".join(output_lines)
     except Exception as e:
@@ -314,17 +389,14 @@ def recommend_performances(
     Returns:
         추천 공연 목록
     """
+    today = datetime.now().strftime("%Y%m%d")
+    week_later = (datetime.now() + timedelta(days=30)).strftime("%Y%m%d")
+
+    # 1) ES 하이브리드 검색 시도
     try:
-        today = datetime.now().strftime("%Y%m%d")
-        week_later = (datetime.now() + timedelta(days=30)).strftime("%Y%m%d")
-
-        # 필터 조건 구성
         filters = _build_filters(genre, region, today, week_later)
-
-        # 추천 쿼리 생성
         search_query = f"{region} {genre} 추천 공연 인기".strip()
 
-        # 하이브리드 검색
         results = _hybrid_search(search_query, filters=filters, top_n=5)
 
         if not results:
@@ -337,6 +409,26 @@ def recommend_performances(
 
         if len(results) >= 5:
             output_lines.append(f"\n상위 5건을 추천합니다.")
+
+        return "\n".join(output_lines)
+    except Exception:
+        pass
+
+    # 2) Graceful Degradation: KOPIS API 폴백
+    try:
+        fallback_results = _kopis_fallback_search(
+            keyword="", genre=genre, region=region,
+            start_date=today, end_date=week_later, rows=5,
+        )
+
+        if not fallback_results:
+            return "현재 추천할 공연이 없습니다. 다른 장르나 지역으로 시도해보세요."
+
+        genre_label = genre if genre else "전체"
+        output_lines = [KOPIS_FALLBACK_NOTICE]
+        output_lines.append(f"{region} 지역 {genre_label} 장르 추천 공연\n")
+        for item in fallback_results:
+            output_lines.append(f"- {_format_kopis_item(item)}")
 
         return "\n".join(output_lines)
     except Exception as e:
