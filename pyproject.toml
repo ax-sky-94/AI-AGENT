@@ -17,6 +17,7 @@ dependencies = [
     "elasticsearch>=8.0.0",
     "opik>=1.10.4",
     "kopisapi>=0.1.0",
+    "slowapi>=0.1.9",
 ]
 
 [build-system]

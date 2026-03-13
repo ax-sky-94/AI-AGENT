@@ -23,6 +23,8 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 def _get_es_client() -> Elasticsearch:
     """ES 클라이언트 (싱글톤 패턴)"""
     if not hasattr(_get_es_client, "_client"):
+        # SEC: ⚠️ SECURITY WARNING — 프로덕션 환경에서는 반드시 verify_certs=True로 변경하세요.
+        # verify_certs=False는 SSL 인증서 검증을 비활성화하여 MITM(중간자 공격)에 취약합니다.
         _get_es_client._client = Elasticsearch(
             settings.ES_URL,
             basic_auth=(settings.ES_USERNAME, settings.ES_PASSWORD),
@@ -263,6 +265,7 @@ def get_performance_detail(performance_id: str) -> str:
         # 2) KOPIS API에서 최신 상세 정보 보완
         url = f"{KOPIS_BASE_URL}pblprfr/{performance_id}"
         params = {"service": settings.KOPIS_API_KEY}
+        # SEC: ⚠️ SECURITY WARNING — 프로덕션 환경에서는 verify=False를 제거하세요.
         response = requests.get(url, params=params, verify=False)
         response.raise_for_status()
 

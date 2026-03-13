@@ -82,6 +82,7 @@ class AgentService:
                         custom_logger.error(traceback.format_exc())
                         agent_task = None
                         # 에러를 스트리밍으로 전송
+                        # SEC: 내부 에러 상세를 사용자에게 노출하지 않음
                         error_response = {
                             "step": "done",
                             "message_id": str(uuid.uuid4()),
@@ -89,7 +90,6 @@ class AgentService:
                             "content": "처리 중 오류가 발생했습니다. 다시 시도해주세요.",
                             "metadata": {},
                             "created_at": datetime.utcnow().isoformat(),
-                            "error": str(e)
                         }
                         yield json.dumps(error_response, ensure_ascii=False)
                         break
@@ -126,6 +126,7 @@ class AgentService:
                         custom_logger.error(f"Error processing chunk: {e}")
                         import traceback
                         custom_logger.error(traceback.format_exc())
+                        # SEC: 내부 에러 상세를 사용자에게 노출하지 않음
                         error_response = {
                             "step": "done",
                             "message_id": str(uuid.uuid4()),
@@ -133,7 +134,6 @@ class AgentService:
                             "content": "데이터 처리 중 오류가 발생했습니다.",
                             "metadata": {},
                             "created_at": datetime.utcnow().isoformat(),
-                            "error": str(e)
                         }
                         yield json.dumps(error_response, ensure_ascii=False)
                         break
@@ -162,6 +162,7 @@ class AgentService:
             error_metadata = {}
             
             # 에러 응답을 스트리밍으로 전송 (HTTPException 대신)
+            # SEC: 내부 에러 상세를 사용자에게 노출하지 않음
             error_response = {
                 "step": "done",
                 "message_id": str(uuid.uuid4()),
@@ -169,7 +170,6 @@ class AgentService:
                 "content": error_content,
                 "metadata": error_metadata,
                 "created_at": datetime.utcnow().isoformat(),
-                "error": str(e) if not isinstance(e, GraphRecursionError) else None
             }
             yield json.dumps(error_response, ensure_ascii=False)
 

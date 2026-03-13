@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     # API 설정
     API_V1_PREFIX: str
 
-    CORS_ORIGINS: List[str] = ["*"]
+    # SEC: CORS 기본값을 로컬 개발 환경으로 제한 (["*"] 사용 금지)
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://localhost:3000"]
     
     # IMP: LangChain 객체 및 LLM 연동에 사용되는 필수 설정값(API Key 등)
     # LangChain 설정
