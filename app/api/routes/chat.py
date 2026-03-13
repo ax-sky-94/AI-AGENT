@@ -5,11 +5,9 @@ from fastapi import APIRouter, HTTPException, Request
 from app.models.chat import ChatRequest
 from app.services.agent_service import AgentService
 from fastapi.responses import StreamingResponse
-from slowapi import Limiter
-from slowapi.util import get_remote_address
+from app.core.limiter import limiter
 
 chat_router = APIRouter()
-limiter = Limiter(key_func=get_remote_address)
 
 
 # SEC: Rate Limiting — /chat 엔드포인트 분당 20회 제한 (OpenAI 비용 폭증/DoS 방지)

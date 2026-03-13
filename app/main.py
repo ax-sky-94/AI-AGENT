@@ -1,16 +1,13 @@
 import time
 from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter, _rate_limit_exceeded_handler
-from slowapi.util import get_remote_address
+from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from app.core.config import settings
+from app.core.limiter import limiter
 from app.api.routes.threads import threads_router
 from app.api.routes.chat import chat_router
 from app.utils.logger import custom_logger
-
-# SEC: Rate Limiting — IP 기반 요청 빈도 제한 (DoS/비용 폭증 방지)
-limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Edu Agent Template",
